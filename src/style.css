@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Prompt:wght@400;500;600;700&display=swap');
+@import url("https://fonts.googleapis.com/css2?family=Prompt:wght@400;500;600;700&display=swap");
 
 html,
 body,
@@ -6,7 +6,7 @@ button,
 input,
 textarea,
 select {
-  font-family: 'Prompt', sans-serif;
+  font-family: "Prompt", sans-serif;
 }
 
 * {
@@ -68,9 +68,7 @@ label {
   background: #111d38;
   color: #f8fbff;
   padding: 30px 16px;
-  display: flex;
-  flex-direction: column;
-  min-height: 100vh;
+  position: sticky;
 }
 .brand {
   display: flex;
@@ -386,9 +384,16 @@ footer {
     display: block;
   }
   .sidebar {
-    width: 100%;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    height: 100dvh;
     min-height: 0;
-    padding: 14px;
+    max-height: 100dvh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    align-self: flex-start;
   }
   .brand {
     padding: 0 6px 12px;

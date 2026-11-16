@@ -13,6 +13,14 @@ contract FreelanceEscrow {
         string proof;
         Status status;
     }
+    struct DisputeInfo {
+        address openedBy;
+        string reason;
+        string evidenceURI;
+        uint256 openedAt;
+        bool exists;
+    }
+    mapping(uint256 => DisputeInfo) private disputeInfo;
     address public immutable admin;
     uint256 public jobCount;
     mapping(uint256 => Job) private jobs;
@@ -21,7 +29,7 @@ contract FreelanceEscrow {
     event JobCreated(uint256 indexed jobId, address indexed employer, address indexed freelancer, uint256 amount);
     event Deposited(uint256 indexed jobId, uint256 amount);
     event WorkSubmitted(uint256 indexed jobId, string proof);
-    event DisputeOpened(uint256 indexed jobId, address indexed by);
+    event DisputeOpened(uint256 indexed jobId, address indexed by, string reason, string evidenceURI, uint256 openedAt);
     event PaymentReleased(uint256 indexed jobId, address indexed to, uint256 amount);
     event Refunded(uint256 indexed jobId, address indexed to, uint256 amount);
 
@@ -76,12 +84,16 @@ contract FreelanceEscrow {
         emit PaymentReleased(id, job.freelancer, job.amount);
     }
 
-    function openDispute(uint256 id) external exists(id) {
+    function openDispute(uint256 id, string calldata reason, string calldata evidenceURI) external exists(id) {
         Job storage job = jobs[id];
         require(msg.sender == job.employer || msg.sender == job.freelancer, "Not a party");
         require(job.status == Status.Funded || job.status == Status.Submitted, "Cannot dispute");
+        require(bytes(reason).length > 0 && bytes(reason).length <= 500, "Reason length invalid");
+        require(bytes(evidenceURI).length <= 300, "Evidence URI too long");
+        require(!disputeInfo[id].exists, "Dispute already exists");
+        disputeInfo[id] = DisputeInfo(msg.sender, reason, evidenceURI, block.timestamp, true);
         job.status = Status.Disputed;
-        emit DisputeOpened(id, msg.sender);
+        emit DisputeOpened(id, msg.sender, reason, evidenceURI, block.timestamp);
     }
 
     function resolveDispute(uint256 id, bool payFreelancer) external exists(id) nonReentrant {
@@ -94,6 +106,10 @@ contract FreelanceEscrow {
         require(ok, "Transfer failed");
         if (payFreelancer) emit PaymentReleased(id, recipient, job.amount);
         else emit Refunded(id, recipient, job.amount);
+    }
+
+    function getDispute(uint256 id) external view exists(id) returns (DisputeInfo memory) {
+        return disputeInfo[id];
     }
 
     function getJob(uint256 id) external view exists(id) returns (Job memory) { return jobs[id]; }
