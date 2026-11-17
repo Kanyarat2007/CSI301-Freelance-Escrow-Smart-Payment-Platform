@@ -68,7 +68,15 @@ label {
   background: #111d38;
   color: #f8fbff;
   padding: 30px 16px;
-  position: sticky;
+  position: fixed;
+  top: 0;
+  left: 0;
+  height: 100vh;
+  height: 100dvh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  z-index: 100;
 }
 .brand {
   display: flex;
@@ -147,7 +155,9 @@ label {
   max-width: 1320px;
   width: 100%;
   padding: 38px 44px;
-  margin: auto;
+  margin: 0 auto 0 246px;
+  max-width: calc(100% - 246px);
+  min-width: 0;
   align-self: flex-start;
 }
 .topbar {
@@ -370,6 +380,8 @@ footer {
     width: 200px;
   }
   .content {
+    margin-left: 200px;
+    max-width: calc(100% - 200px);
     padding: 28px 22px;
   }
   .stats {
@@ -386,8 +398,9 @@ footer {
   .sidebar {
     position: sticky;
     top: 0;
-    height: 100vh;
-    height: 100dvh;
+    left: auto;
+    width: 100%;
+    height: auto;
     min-height: 0;
     max-height: 100dvh;
     overflow-y: auto;
@@ -412,6 +425,8 @@ footer {
     padding: 10px;
   }
   .content {
+    margin-left: 0;
+    max-width: 100%;
     padding: 22px 14px;
   }
   .topbar {

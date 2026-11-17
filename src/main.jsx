@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ethers } from "ethers";
 import "./style.css";
@@ -255,6 +255,7 @@ function App() {
   const [txs, setTxs] = useState([]);
   const [historyError, setHistoryError] = useState("");
   const [historyLoading, setHistoryLoading] = useState(false);
+  const historyRequestRef = useRef(0);
   const [disputeForms, setDisputeForms] = useState({});
   const [disputeDetails, setDisputeDetails] = useState({});
   const [message, setMessage] = useState("");
@@ -279,18 +280,47 @@ function App() {
         : null,
     [validConfig],
   );
+  // Retry only temporary RPC/network failures; do not retry invalid configuration.
+  async function rpcWithRetry(operation, attempts = 3) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
+        return await operation();
+      } catch (error) {
+        const code = Number(
+          error?.info?.response?.status || error?.status || 0,
+        );
+        const message = errorText(error).toLowerCase();
+        const retryable =
+          [429, 500, 502, 503, 504].includes(code) ||
+          /missing response|timeout|timed out|network|rate limit|too many requests|server error|bad gateway|temporarily unavailable/i.test(
+            message,
+          );
+        if (!retryable || attempt === attempts - 1) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 600 * 2 ** attempt));
+      }
+    }
+  }
+
   async function loadHistory(visibleJobs, currentAccount, currentAdmin) {
-    if (!reader) return;
+    const requestId = ++historyRequestRef.current;
+    if (!reader || !currentAccount) {
+      setTxs([]);
+      setHistoryError("");
+      setHistoryLoading(false);
+      return;
+    }
+
     setHistoryLoading(true);
     setHistoryError("");
     try {
       const provider = reader.runner;
-      const latest = await provider.getBlockNumber();
-      // Without deployment block, scan only the most recent 10,000 blocks.
+      const latest = await rpcWithRetry(() => provider.getBlockNumber());
       const startBlock =
         DEPLOYMENT_BLOCK > 0 ? DEPLOYMENT_BLOCK : Math.max(0, latest - 10000);
-      if (startBlock > latest)
+      if (startBlock > latest) {
         throw Error("VITE_DEPLOYMENT_BLOCK exceeds current block");
+      }
+
       const isOwner = eq(currentAccount, currentAdmin);
       const allowedIds = new Set(
         visibleJobs
@@ -302,56 +332,94 @@ function App() {
           )
           .map((j) => j.id),
       );
-      if (!currentAccount) {
-        setTxs([]);
+      if (allowedIds.size === 0) {
+        if (requestId === historyRequestRef.current) setTxs([]);
         return;
       }
+
+      // One eth_getLogs call per range instead of six queryFilter calls.
+      // The first topic can match any of the contract's event signatures.
       const eventNames = Object.keys(TX_LABELS);
+      const eventTopics = eventNames.map(
+        (name) => reader.interface.getEvent(name).topicHash,
+      );
       const found = [];
-      // Chunk eth_getLogs calls for RPC compatibility.
-      for (let from = startBlock; from <= latest; from += 2000) {
-        const to = Math.min(latest, from + 1999);
-        const chunks = await Promise.all(
-          eventNames.map((name) =>
-            reader.queryFilter(reader.filters[name](), from, to),
-          ),
+      const MAX_EVENTS = 100;
+      const BLOCK_RANGE = 1000;
+
+      // Scan newest blocks first so the dashboard finds recent events quickly.
+      for (let to = latest; to >= startBlock; to -= BLOCK_RANGE) {
+        if (requestId !== historyRequestRef.current) return;
+        const from = Math.max(startBlock, to - BLOCK_RANGE + 1);
+        const logs = await rpcWithRetry(() =>
+          provider.getLogs({
+            address: CONTRACT,
+            fromBlock: from,
+            toBlock: to,
+            topics: [eventTopics],
+          }),
         );
-        for (let i = 0; i < chunks.length; i++) {
-          for (const log of chunks[i]) {
-            const jobId = Number(log.args.jobId);
-            if (allowedIds.has(jobId))
-              found.push({
-                method: eventNames[i],
-                jobId,
-                hash: log.transactionHash,
-                block: log.blockNumber,
-                logIndex: log.index,
-                amount: [
-                  "Deposited",
-                  "PaymentReleased",
-                  "Refunded",
-                  "JobCreated",
-                ].includes(eventNames[i])
-                  ? log.args.amount
-                  : null,
-              });
+
+        for (const log of logs) {
+          let parsed;
+          try {
+            parsed = reader.interface.parseLog(log);
+          } catch {
+            continue;
           }
+          if (!parsed || !Object.hasOwn(TX_LABELS, parsed.name)) continue;
+          const jobId = Number(parsed.args.jobId);
+          if (!allowedIds.has(jobId)) continue;
+          found.push({
+            method: parsed.name,
+            jobId,
+            hash: log.transactionHash,
+            block: log.blockNumber,
+            logIndex: log.index,
+            amount: [
+              "Deposited",
+              "PaymentReleased",
+              "Refunded",
+              "JobCreated",
+            ].includes(parsed.name)
+              ? parsed.args.amount
+              : null,
+          });
+        }
+        if (found.length >= MAX_EVENTS) break;
+      }
+
+      found.sort((a, b) => b.block - a.block || b.logIndex - a.logIndex);
+      const display = found.slice(0, MAX_EVENTS);
+      const blockDates = new Map();
+      // Dates are optional. A failing timestamp lookup must not hide transactions.
+      // Limit extra requests; block number and Etherscan link remain available.
+      for (const block of [...new Set(display.map((x) => x.block))].slice(
+        0,
+        20,
+      )) {
+        if (requestId !== historyRequestRef.current) return;
+        try {
+          const info = await rpcWithRetry(() => provider.getBlock(block), 2);
+          if (info) blockDates.set(block, Number(info.timestamp));
+        } catch (error) {
+          console.warn("Cannot load block timestamp", block, error);
         }
       }
-      found.sort((a, b) => b.block - a.block || b.logIndex - a.logIndex);
-      const blockDates = new Map();
-      const display = found.slice(0, 100);
-      for (const block of [...new Set(display.map((x) => x.block))]) {
-        const info = await provider.getBlock(block);
-        if (info) blockDates.set(block, Number(info.timestamp));
+      if (requestId === historyRequestRef.current) {
+        setTxs(
+          display.map((x) => ({ ...x, timestamp: blockDates.get(x.block) })),
+        );
       }
-      setTxs(
-        display.map((x) => ({ ...x, timestamp: blockDates.get(x.block) })),
-      );
-    } catch (e) {
-      setHistoryError("โหลดประวัติจาก Blockchain ไม่สำเร็จ: " + errorText(e));
+    } catch (error) {
+      console.error("Blockchain history RPC error:", error);
+      if (requestId === historyRequestRef.current) {
+        setHistoryError(
+          "โหลดประวัติจาก Blockchain ไม่สำเร็จ: " + errorText(error),
+        );
+      }
     } finally {
-      setHistoryLoading(false);
+      if (requestId === historyRequestRef.current) setHistoryLoading(false);
     }
   }
 
@@ -391,17 +459,6 @@ function App() {
         }),
       );
       setDisputeDetails(Object.fromEntries(infos));
-      const wallets = window.ethereum
-        ? await window.ethereum.request({ method: "eth_accounts" })
-        : [];
-      const chain = window.ethereum
-        ? await window.ethereum.request({ method: "eth_chainId" })
-        : "";
-      await loadHistory(
-        sorted,
-        chain?.toLowerCase() === "0xaa36a7" ? wallets[0] || "" : "",
-        owner,
-      );
     } catch (e) {
       setMessage("อ่านข้อมูลไม่สำเร็จ: " + errorText(e));
     } finally {
@@ -458,6 +515,15 @@ function App() {
     if (reader && account) refresh();
     else if (!account) setTxs([]);
   }, [account]);
+  // Refreshing jobs does not wait for a potentially slow history scan.
+  useEffect(() => {
+    if (!reader) return;
+    loadHistory(jobs, account, admin);
+    return () => {
+      historyRequestRef.current += 1;
+    };
+  }, [reader, jobs, account, admin]);
+
   async function connect() {
     if (!window.ethereum) {
       setMessage("กรุณาติดตั้ง MetaMask");
@@ -561,10 +627,16 @@ function App() {
   const jobPages = Math.max(1, Math.ceil(shown.length / JOB_PAGE_SIZE));
   const historyPages = Math.max(1, Math.ceil(txs.length / HISTORY_PAGE_SIZE));
   const visibleJobs = showAllJobs
-    ? shown.slice((Math.min(jobPage, jobPages) - 1) * JOB_PAGE_SIZE, Math.min(jobPage, jobPages) * JOB_PAGE_SIZE)
+    ? shown.slice(
+        (Math.min(jobPage, jobPages) - 1) * JOB_PAGE_SIZE,
+        Math.min(jobPage, jobPages) * JOB_PAGE_SIZE,
+      )
     : shown.slice(0, 1);
   const visibleHistory = showAllHistory
-    ? txs.slice((Math.min(historyPage, historyPages) - 1) * HISTORY_PAGE_SIZE, Math.min(historyPage, historyPages) * HISTORY_PAGE_SIZE)
+    ? txs.slice(
+        (Math.min(historyPage, historyPages) - 1) * HISTORY_PAGE_SIZE,
+        Math.min(historyPage, historyPages) * HISTORY_PAGE_SIZE,
+      )
     : txs.slice(0, 5);
   const changeRole = (nextRole) => {
     setRole(nextRole);
@@ -789,18 +861,40 @@ function App() {
               ))}
               {shown.length > 1 && (
                 <div className="list-controls">
-                  <span className="list-count">{showAllJobs
-                    ? `แสดง ${Math.min((jobPage - 1) * JOB_PAGE_SIZE + 1, shown.length)}–${Math.min(jobPage * JOB_PAGE_SIZE, shown.length)} จาก ${shown.length} งาน`
-                    : `แสดงงานล่าสุด 1 จาก ${shown.length} งาน`}</span>
+                  <span className="list-count">
+                    {showAllJobs
+                      ? `แสดง ${Math.min((jobPage - 1) * JOB_PAGE_SIZE + 1, shown.length)}–${Math.min(jobPage * JOB_PAGE_SIZE, shown.length)} จาก ${shown.length} งาน`
+                      : `แสดงงานล่าสุด 1 จาก ${shown.length} งาน`}
+                  </span>
                   {showAllJobs && jobPages > 1 && (
                     <div className="pagination" aria-label="แบ่งหน้างาน">
-                      <button className="secondary" disabled={jobPage <= 1} onClick={() => setJobPage(p => p - 1)}>ก่อนหน้า</button>
-                      <span>หน้า {jobPage} / {jobPages}</span>
-                      <button className="secondary" disabled={jobPage >= jobPages} onClick={() => setJobPage(p => p + 1)}>ถัดไป</button>
+                      <button
+                        className="secondary"
+                        disabled={jobPage <= 1}
+                        onClick={() => setJobPage((p) => p - 1)}
+                      >
+                        ก่อนหน้า
+                      </button>
+                      <span>
+                        หน้า {jobPage} / {jobPages}
+                      </span>
+                      <button
+                        className="secondary"
+                        disabled={jobPage >= jobPages}
+                        onClick={() => setJobPage((p) => p + 1)}
+                      >
+                        ถัดไป
+                      </button>
                     </div>
                   )}
-                  <button className="secondary" onClick={() => { setShowAllJobs(v => !v); setJobPage(1); }}>
-                    {showAllJobs ? "ย่อเหลืองานล่าสุด" : `ดูงานทั้งหมด (${shown.length})`}
+                  <button
+                    className="secondary"
+                    onClick={() => {
+                      setShowAllJobs((v) => !v);
+                      setJobPage(1);
+                    }}
+                  >
+                    {showAllJobs ? "ดูน้อยลง" : `ดูเพิ่มเติม (${shown.length})`}
                   </button>
                 </div>
               )}
@@ -860,18 +954,40 @@ function App() {
           )}
           {!historyLoading && txs.length > 5 && (
             <div className="list-controls">
-              <span className="list-count">{showAllHistory
-                ? `แสดง ${Math.min((historyPage - 1) * HISTORY_PAGE_SIZE + 1, txs.length)}–${Math.min(historyPage * HISTORY_PAGE_SIZE, txs.length)} จาก ${txs.length} รายการ`
-                : `แสดง 5 รายการล่าสุด จาก ${txs.length} รายการ`}</span>
+              <span className="list-count">
+                {showAllHistory
+                  ? `แสดง ${Math.min((historyPage - 1) * HISTORY_PAGE_SIZE + 1, txs.length)}–${Math.min(historyPage * HISTORY_PAGE_SIZE, txs.length)} จาก ${txs.length} รายการ`
+                  : `แสดง 5 รายการล่าสุด จาก ${txs.length} รายการ`}
+              </span>
               {showAllHistory && historyPages > 1 && (
                 <div className="pagination" aria-label="แบ่งหน้าประวัติธุรกรรม">
-                  <button className="secondary" disabled={historyPage <= 1} onClick={() => setHistoryPage(p => p - 1)}>ก่อนหน้า</button>
-                  <span>หน้า {historyPage} / {historyPages}</span>
-                  <button className="secondary" disabled={historyPage >= historyPages} onClick={() => setHistoryPage(p => p + 1)}>ถัดไป</button>
+                  <button
+                    className="secondary"
+                    disabled={historyPage <= 1}
+                    onClick={() => setHistoryPage((p) => p - 1)}
+                  >
+                    ก่อนหน้า
+                  </button>
+                  <span>
+                    หน้า {historyPage} / {historyPages}
+                  </span>
+                  <button
+                    className="secondary"
+                    disabled={historyPage >= historyPages}
+                    onClick={() => setHistoryPage((p) => p + 1)}
+                  >
+                    ถัดไป
+                  </button>
                 </div>
               )}
-              <button className="secondary" onClick={() => { setShowAllHistory(v => !v); setHistoryPage(1); }}>
-                {showAllHistory ? "ย่อเหลือรายการล่าสุด" : `ดูประวัติทั้งหมด (${txs.length})`}
+              <button
+                className="secondary"
+                onClick={() => {
+                  setShowAllHistory((v) => !v);
+                  setHistoryPage(1);
+                }}
+              >
+                {showAllHistory ? "ดูน้อยลง" : `ดูเพิ่มเติม (${txs.length})`}
               </button>
             </div>
           )}
@@ -883,10 +999,7 @@ function App() {
             (Admin เห็นทุกงาน)
           </p> */}
         </section>
-        <footer>
-          DigitalWork Solutions · Ethereum Sepolia Testnet ·
-          สำหรับการศึกษาและทดสอบเท่านั้น
-        </footer>
+        <footer>Ethereum Sepolia Testnet</footer>
       </main>
     </div>
   );
