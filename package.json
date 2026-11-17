@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
-    "build": "vite build"
+    "build": "vite build",
+    "predeploy": "npm run build",
+    "deploy": "gh-pages -d dist"
   },
   "dependencies": {
     "ethers": "^6.13.0",
@@ -13,6 +15,7 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "gh-pages": "^6.3.0",
     "vite": "^5.4.0"
   }
 }
